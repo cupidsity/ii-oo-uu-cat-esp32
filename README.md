@@ -6,6 +6,17 @@ The video is stored as one JPEG per frame in its own flash partition. The player
 
 Frames are decoded with [JPEGDEC](https://github.com/bitbank2/JPEGDEC), which uses the ESP32-S3's SIMD instructions (about 7.4 ms per frame here, against a 16.7 ms budget). Two frame buffers let the next frame decode while the previous one is still going out to the screen over DMA. Frames are picked by the clock, so playback stays real-time even if a frame is slow to decode.
 
+## Buttons
+
+| Button | Action |
+|---|---|
+| GPIO14 | Power off / on. Off is deep sleep: the screen and backlight are shut down and the press wakes it back up, restarting the video. |
+| GPIO0 (BOOT) | Show or hide a battery badge in the top-right corner. |
+
+The battery percentage is estimated from the voltage on GPIO4, which the board halves through a divider. While USB is plugged in, the charger lifts that voltage, so the badge shows a charging bolt and reads high; unplug USB for an accurate number. A reading above 4.2V with USB in means no battery is connected.
+
+The LiPo keeps charging from USB-C even while the board is off, since charging is handled by its own chip.
+
 ## Flashing
 
 Requires [PlatformIO](https://platformio.org/) and `esptool`.
