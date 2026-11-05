@@ -8,7 +8,7 @@ from pathlib import Path
 
 screen_width = 320
 screen_height = 170
-frames_per_second = 30
+frames_per_second = 60
 # 2 is near the best quality ffmpeg's jpeg encoder gives; frames at this size still average only ~5KB
 jpeg_quality = 2
 

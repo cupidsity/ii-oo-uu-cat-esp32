@@ -2,6 +2,7 @@
 #include <esp_partition.h>
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
+#include <JPEGDEC.h>
 
 // lilygo t-display-s3 wiring; the screen uses an 8-bit parallel bus rather than spi, which is what makes full-screen video fast enough
 const int lcdPowerPin = 15;   // must be HIGH or the screen stays dark when running on battery
@@ -61,6 +62,14 @@ class TDisplayS3 : public lgfx::LGFX_Device {
 };
 
 TDisplayS3 screen;
+// jpegdec uses the s3's simd instructions and decodes several times faster than lovyangfx's built-in decoder, which is what makes 60 fps reachable
+JPEGDEC jpegDecoder;
+
+const int screenWidth = 320;
+const int screenHeight = 170;
+// two frame buffers so one frame can be decoded while the previous one is still being sent to the screen by dma
+uint16_t *frameBuffers[2] = {nullptr, nullptr};
+int decodingBufferIndex = 0;
 
 // matches the layout written by tools/make_video.py
 struct VideoHeader {
@@ -80,6 +89,20 @@ struct FrameIndexEntry {
 const uint8_t *videoData = nullptr;
 const VideoHeader *videoHeader = nullptr;
 const FrameIndexEntry *frameIndex = nullptr;
+
+// jpegdec hands over the image in blocks; copy each into the frame buffer, clipping the padding it adds past the 170px height
+int copyDecodedBlock(JPEGDRAW *decodedBlock) {
+  uint16_t *frameBuffer = frameBuffers[decodingBufferIndex];
+  int copyWidth = min(decodedBlock->iWidth, screenWidth - decodedBlock->x);
+  for (int blockRow = 0; blockRow < decodedBlock->iHeight; blockRow++) {
+    int screenRow = decodedBlock->y + blockRow;
+    if (screenRow >= screenHeight) break;
+    memcpy(frameBuffer + screenRow * screenWidth + decodedBlock->x,
+           decodedBlock->pPixels + blockRow * decodedBlock->iWidth,
+           copyWidth * sizeof(uint16_t));
+  }
+  return 1;
+}
 
 void showError(const char *message) {
   screen.fillScreen(TFT_BLACK);
@@ -116,6 +139,16 @@ void setup() {
   screen.setBrightness(255);
   screen.fillScreen(TFT_BLACK);
 
+  for (int bufferIndex = 0; bufferIndex < 2; bufferIndex++) {
+    frameBuffers[bufferIndex] = (uint16_t *)heap_caps_malloc(screenWidth * screenHeight * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!frameBuffers[bufferIndex]) {
+      showError("not enough ram\nfor frame buffers");
+      while (true) delay(1000);
+    }
+  }
+  // dma transfers need the bus held open for the whole run, so it's claimed once here and never released
+  screen.startWrite();
+
   if (!mapVideo()) {
     showError("no video found\nflash data/video.bin");
     while (true) delay(1000);
@@ -125,12 +158,13 @@ void setup() {
 
 void loop() {
   static uint32_t loopStartMs = millis();
-  uint32_t frameDurationMs = 1000 / videoHeader->framesPerSecond;
-  uint32_t loopLengthMs = videoHeader->frameCount * frameDurationMs;
+  // computed from the total instead of a whole-millisecond frame duration, since 1000/60 doesn't divide evenly and the video would play ~4% fast
+  uint32_t loopLengthMs = (uint64_t)videoHeader->frameCount * 1000 / videoHeader->framesPerSecond;
 
   // pick the frame from the clock instead of just counting up, so if decoding ever runs slow the video skips frames rather than drifting into slow motion
   uint32_t elapsedMs = (millis() - loopStartMs) % loopLengthMs;
-  uint32_t frameNumber = elapsedMs / frameDurationMs;
+  uint32_t frameNumber = (uint64_t)elapsedMs * videoHeader->framesPerSecond / 1000;
+  if (frameNumber >= videoHeader->frameCount) frameNumber = videoHeader->frameCount - 1;
 
   static int32_t lastDrawnFrame = -1;
   if ((int32_t)frameNumber == lastDrawnFrame) {
@@ -140,15 +174,31 @@ void loop() {
   lastDrawnFrame = frameNumber;
 
   const FrameIndexEntry &frame = frameIndex[frameNumber];
-  screen.drawJpg(videoData + frame.offset, frame.length, 0, 0);
+  uint32_t decodeStartUs = micros();
+  if (jpegDecoder.openRAM((uint8_t *)(videoData + frame.offset), frame.length, copyDecodedBlock)) {
+    // big endian is the byte order the screen expects, so the buffer can go out over dma untouched
+    jpegDecoder.setPixelType(RGB565_BIG_ENDIAN);
+    jpegDecoder.decode(0, 0, 0);
+    jpegDecoder.close();
+  }
+  uint32_t decodeUs = micros() - decodeStartUs;
+
+  // the previous frame's dma transfer used the other buffer, so it only has to be finished before starting this one
+  screen.waitDMA();
+  screen.pushImageDMA(0, 0, screenWidth, screenHeight, (lgfx::swap565_t *)frameBuffers[decodingBufferIndex]);
+  decodingBufferIndex = 1 - decodingBufferIndex;
 
   // a once-per-loop report so playback speed can be checked over usb
   static uint32_t framesDrawnThisLoop = 0;
+  static uint64_t totalDecodeUs = 0;
   static uint32_t previousElapsedMs = 0;
   framesDrawnThisLoop++;
+  totalDecodeUs += decodeUs;
   if (elapsedMs < previousElapsedMs) {
-    Serial.printf("loop done: drew %u of %u frames\n", framesDrawnThisLoop, videoHeader->frameCount);
+    Serial.printf("loop done: drew %u of %u frames, average decode %.1f ms\n", framesDrawnThisLoop,
+                  videoHeader->frameCount, totalDecodeUs / 1000.0 / framesDrawnThisLoop);
     framesDrawnThisLoop = 0;
+    totalDecodeUs = 0;
   }
   previousElapsedMs = elapsedMs;
 }
